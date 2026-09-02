@@ -1,0 +1,271 @@
+# Prometheus Chunk, Block & Compaction : Complete Understanding Guide 📊
+
+---
+
+## 1. One-Sentence Answer
+
+**In Prometheus, a "chunk" is one time series' compressed samples, and a "block" is the outer directory holding every series' chunks plus an index for a fixed time window — the exact opposite containment direction from Loki.**
+
+---
+
+## 2. Analogy Section 🗄️
+
+Think of it like a **filing cabinet for a specific 2-hour period**.
+
+```
+╔═══════════════════════════════════════════════════════════╗
+║          🗄️ THE BLOCK (Directory, fixed time range)         ║
+║  ┌─────────────────────────────────────────────────────┐  ║
+║  │  📂 chunks/                                            │  ║
+║  │   📦 chunk file 000001 (many series' chunks packed)   │  ║
+║  │   📦 chunk file 000002                                 │  ║
+║  │      → 📈 series A's samples (XOR-compressed)          │  ║
+║  │      → 📈 series B's samples (XOR-compressed)          │  ║
+║  └─────────────────────────────────────────────────────┘  ║
+║  ┌─────────────────────────────────────────────────────┐  ║
+║  │  🔍 index (labels/series → chunk locations)            │  ║
+║  │  🪦 tombstones (deletion records)                       │  ║
+║  │  📄 meta.json (min/max time, stats, compaction info)   │  ║
+║  └─────────────────────────────────────────────────────┘  ║
+╚═══════════════════════════════════════════════════════════╝
+```
+
+1. 📈 Each **series** (unique metric + label combo) gets its own folder of samples.
+2. 📦 Those samples get compressed into a **chunk** — one series, one time window.
+3. 🗄️ Every series' chunks for the same 2-hour period, plus an index, tombstones, and metadata, live together inside one **block** directory.
+4. 🧹 Periodically, several small blocks get merged by **compaction** into fewer, bigger blocks.
+
+---
+
+## 3. Complete Data/Process Flow
+
+### STEP 1 — A sample is scraped 📈
+
+```
+┌──────────────────────────────────────────────┐
+│  📈 SAMPLE                                     │
+│  series: metric name + label set              │
+│  timestamp + value                            │
+└──────────────────────────────────────────────┘
+```
+💡 **Key insight:** Every sample belongs to exactly one **time series** — a unique metric+label combination.
+
+---
+
+### STEP 2 — Samples accumulate into a Chunk 📦
+
+```
+┌──────────────────────────────────────────────┐
+│  📦 CHUNK (for ONE series)                     │
+│  up to 120 samples per chunk (default)         │
+│  encoding: XOR / Gorilla-style compression     │
+│   - delta-of-delta timestamps                 │
+│   - XOR'd float values                        │
+│  → ~1–2 bytes/sample                          │
+└──────────────────────────────────────────────┘
+```
+💡 **Key insight:** A chunk is scoped to **one series only**. With a default 2-hour block window and typical scrape intervals, that's roughly one chunk per series per ~2 hours.
+
+---
+
+### STEP 3 — Chunks live in the in-memory Head Block 🧠
+
+```
+┌──────────────────────────────────────────────┐
+│  🧠 HEAD BLOCK (in-memory)                     │
+│  most recent ~2 hours of data                 │
+│  holds chunks for ALL active series            │
+└──────────────────────────────────────────────┘
+```
+💡 **Key insight:** New data always lands in the head block first — it isn't a directory on disk yet.
+
+---
+
+### STEP 4 — Head Block flushes to a persisted Block on disk 🗄️
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  🗄️ BLOCK (disk directory, ULID-named, e.g. 01FG.../)      │
+│  ├── 📂 chunks/                                            │
+│  │    ├── 📦 000001                                        │
+│  │    └── 📦 000002                                        │
+│  ├── 🔍 index        (series/labels → chunk locations)     │
+│  ├── 🪦 tombstones    (deleted series/time-range records)  │
+│  └── 📄 meta.json     (min/max time, stats, compaction info)│
+└──────────────────────────────────────────────────────────┘
+```
+💡 **Key insight:** The **block is the umbrella** here — the reverse of Loki, where the chunk was the umbrella. In Prometheus, chunks live *inside* blocks.
+
+---
+
+### STEP 5 — Compaction merges small blocks into bigger ones 🧹
+
+```
+┌──────────────────────────────────────────────┐
+│  🧹 COMPACTION                                 │
+│  1. Merge chunks (same series, across blocks) │
+│     into fewer, larger chunks                 │
+│  2. Rebuild index for the new time range       │
+│  3. Apply tombstones → actually delete data    │
+│  4. Remove old small blocks once verified      │
+│                                                │
+│  step pattern: 2h → 36h → up to ~10 days      │
+│  (exact ratios depend on version/config)       │
+└──────────────────────────────────────────────┘
+```
+💡 **Key insight:** Compaction exists because many tiny 2-hour blocks are expensive — both in per-block index overhead and in how many blocks a multi-day query has to open.
+
+---
+
+## 4. Deep Dive Sections
+
+### 📈 Series
+
+**What it is:** A unique metric name + label set combination.
+**What it contains:** A stream of `(timestamp, value)` samples over time.
+**Why it matters:** It's the fundamental unit chunks are scoped to — everything else builds on "which series does this sample belong to."
+
+```
+Example A                          Example B
+┌────────────────────────┐         ┌────────────────────────┐
+│ 📈 http_requests_total   │         │ 📈 http_requests_total   │
+│ {method="GET"}          │         │ {method="POST"}         │
+└────────────────────────┘         └────────────────────────┘
+```
+Same metric name, different label (`GET` vs `POST`) → **two distinct series**, each getting its own separate chunks.
+
+---
+
+### 📦 Chunk
+
+**What it is:** A compressed sequence of samples for a **single time series**, covering a time range.
+**What it contains:** Up to 120 samples (default) using XOR/Gorilla-style compression (delta-of-delta timestamps, XOR'd values), reaching ~1–2 bytes/sample.
+**Why it matters:** This is the actual compressed data payload — one chunk per series per roughly 2-hour window at typical scrape intervals.
+
+```
+Example A (120 samples)            Example B (fewer samples, shorter window)
+┌────────────────────────┐         ┌────────────────────────┐
+│ 📦 CHUNK                 │         │ 📦 CHUNK                 │
+│ series: cpu_usage        │         │ series: cpu_usage        │
+│ 120 samples, ~2h window  │         │ 40 samples, <1h window   │
+│ XOR-compressed           │         │ XOR-compressed           │
+└────────────────────────┘         └────────────────────────┘
+```
+Same series, different sample counts → chunk size/duration varies with scrape frequency and how full the chunk got before rollover, but the compression scheme and per-series scoping stay the same.
+
+---
+
+### 🗄️ Block
+
+**What it is:** A directory on disk holding **all series' data for a fixed time range** (default 2 hours when freshly flushed).
+**What it contains:** A `chunks/` folder (many series' chunk files packed together), an `index` (series/labels → chunk locations), `tombstones` (deletion records), and `meta.json` (min/max time, stats, compaction info).
+**Why it matters:** It's the umbrella structure and the unit compaction operates on — the reverse containment direction from Loki's chunk.
+
+```
+Example A (fresh block)            Example B (compacted block)
+┌────────────────────────┐         ┌────────────────────────┐
+│ 🗄️ BLOCK                 │         │ 🗄️ BLOCK                 │
+│ 2h window                │         │ 36h window (merged)      │
+│ chunks/ + index + meta   │         │ chunks/ + index + meta   │
+│ from ONE flush            │        │ merged from MANY blocks  │
+└────────────────────────┘         └────────────────────────┘
+```
+A freshly-flushed block covers a short window (2h); after compaction, a block covers a much larger merged window (up to ~10 days) while still keeping the same internal shape (`chunks/`, `index`, `tombstones`, `meta.json`).
+
+---
+
+### 🧹 Compaction
+
+**What it is:** The background process that merges multiple smaller blocks into fewer, larger blocks.
+**What it contains (as steps):** Merge same-series chunks → rebuild index → apply tombstones (real deletion) → remove old blocks.
+**Why it matters:** Keeps per-block index overhead down and lets multi-day queries open far fewer blocks. Step pattern: **2h → 36h → up to ~10 days** (exact ratios depend on version/config).
+
+---
+
+## 5. Full Lifecycle Diagram 🔁
+
+```
+1️⃣ Sample scraped for a series (metric + labels, ts + value)
+        ▼
+2️⃣ 📦 Samples accumulate into a per-series CHUNK
+      (up to 120 samples, XOR/Gorilla compressed)
+        ▼
+3️⃣ 🧠 Chunk lives in the in-memory HEAD BLOCK
+      (all active series, most recent ~2h)
+        ▼
+4️⃣ 🗄️ Head block flushes to disk as a BLOCK directory
+      (chunks/ + index + tombstones + meta.json)
+        ▼
+5️⃣ Repeat 1️⃣–4️⃣ → many small 2h blocks accumulate
+        ▼
+6️⃣ 🧹 COMPACTOR merges same-series chunks across blocks,
+      rebuilds index, applies tombstones, deletes old blocks
+        ▼
+7️⃣ 🗄️ Fewer, larger BLOCKS remain (36h → up to ~10 days)
+```
+
+---
+
+## 6. Comparison Example ⚖️
+
+| Scenario | Loki | Prometheus |
+|---|---|---|
+| **Chunk** | Outer container: multiple blocks + labels for one stream | Inner unit: one series' compressed samples |
+| **Block** | Inner unit: a batch of log lines inside a chunk | Outer container: all series' chunks + index for a time range |
+| **Compaction** | Merges small chunk index files, dedupes | Merges multiple time-range blocks into fewer, larger ones; also drops deleted data |
+
+**Cause → effect:** The word "chunk" and "block" are reused in both systems, but the containment relationship **inverts**: Loki chunk ⊃ blocks, while Prometheus block ⊃ chunks. Reading Prometheus docs with a Loki mental model (or vice versa) will get the hierarchy backwards.
+
+---
+
+## 7. Quick Reference Card 🗂️
+
+```
+┌───────────────┬────────────────────────────┬─────────────────────┬──────────────────────────────┐
+│ Term           │ Contains                   │ Size / Default        │ Purpose                       │
+├───────────────┼────────────────────────────┼─────────────────────┼──────────────────────────────┤
+│ 📈 Series       │ (timestamp, value) samples │ —                     │ Unique metric + label combo   │
+│ 📦 Chunk        │ Compressed samples,        │ ≤120 samples/chunk,   │ Efficient per-series storage  │
+│                │ ONE series only             │ ~1–2 bytes/sample     │ (XOR / Gorilla compression)   │
+│ 🧠 Head block   │ Chunks for ALL series       │ ~2h in-memory window  │ Recent, not-yet-persisted data│
+│ 🗄️ Block        │ chunks/ + index +          │ 2h fresh → up to      │ Umbrella storage unit; on-disk│
+│                │ tombstones + meta.json      │ ~10 days compacted    │ directory, unit of compaction │
+│ 🧹 Compaction   │ (process, not a structure)  │ step pattern:          │ Merge blocks, rebuild index,  │
+│                │                             │ 2h → 36h → ~10 days   │ apply deletions, save space   │
+└───────────────┴────────────────────────────┴─────────────────────┴──────────────────────────────┘
+```
+
+---
+
+## 8. Key Takeaways ✅
+
+**Containment order**
+- ✅ Samples go **into** a chunk (one series per chunk).
+- ✅ Chunks go **into** a block (many series per block).
+- ✅ The **block** is the outer/umbrella structure — the opposite of Loki, where the chunk is the umbrella.
+
+**Compression & efficiency**
+- ✅ Chunks use **XOR/Gorilla-style compression** — delta-of-delta timestamps + XOR'd values — getting down to ~1–2 bytes/sample.
+- ✅ Default cap: **120 samples per chunk**, roughly matching a ~2-hour window at typical scrape intervals.
+
+**Lifecycle & compaction**
+- ✅ New data lives in the in-memory **head block** first, then flushes to a disk **block** (default 2h).
+- ✅ **Compaction** merges small blocks into larger ones (2h → 36h → up to ~10 days), rebuilding the index and actually applying tombstoned deletions.
+
+**One-line summary:**
+📈 Sample → 📦 Chunk (per series, compressed) → 🧠 Head block (in-memory) → 🗄️ Block (on-disk, all series + index) → 🧹 Compaction (merges blocks over time)
+
+---
+
+## 9. Memory Trick 🧠
+
+> **"In Loki, the Chunk is the Cabinet. In Prometheus, the Block is the Cabinet."**
+> 📦 Prometheus chunk = one labeled folder of samples for one series · 🗄️ Prometheus block = the whole filing cabinet drawer for a time period, holding every series' folders plus an index.
+
+If you're ever unsure which system nests which way, remember: **"Loki's chunk holds blocks; Prometheus's block holds chunks."** Same two words, mirrored meaning.
+
+---
+
+### Plain-language recap
+
+The source explained that Prometheus reuses the words "chunk" and "block" from Loki but with the containment **inverted**. In Prometheus, a **chunk** is the compressed data for a single time series (up to 120 samples, XOR/Gorilla-compressed, ~1–2 bytes/sample) covering roughly a 2-hour window. A **block** is the umbrella: an on-disk directory holding every series' chunks for that time range, plus an index, tombstones, and metadata. New data first lives in an in-memory **head block** before being flushed to disk as a persisted block. Over time, the **compactor** merges many small blocks into fewer, larger ones (following a step pattern like 2h → 36h → up to ~10 days), rebuilding the index and permanently applying any deletions along the way. The key contrast with Loki: Loki's chunk contains blocks, while Prometheus's block contains chunks — same terms, opposite direction.
