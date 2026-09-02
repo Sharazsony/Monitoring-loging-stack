@@ -1,0 +1,465 @@
+# Grafana Loki Architecture : Complete Understanding Guide 📊
+
+---
+
+## 1. One-Sentence Answer
+
+**Loki is a log storage system that hashes labels to form a "Stream ID," groups matching log lines into compressed "chunks," keeps a tiny "index" pointing to those chunks, and uses separate write-side and read-side microservices (talking to shared object storage) to ingest and query logs at scale.**
+
+---
+
+## 2. Analogy Section — The Library 📚
+
+Think of Loki like a **library with a smart filing system**, instead of one giant pile of books.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     📚 THE LIBRARY ANALOGY                        │
+│                                                                    │
+│   🏷️  Labels (component, location, level)                        │
+│         │                                                         │
+│         ▼                                                         │
+│   🔑 Hash → "Shelf Number" (Stream ID)                            │
+│         │                                                         │
+│         ▼                                                         │
+│   📦 Box on that shelf = CHUNK (holds many log "pages")           │
+│         │                                                         │
+│         ▼                                                         │
+│   📇 Card Catalog = INDEX (tells you which shelf/box to check)    │
+│         │                                                         │
+│         ▼                                                         │
+│   🏢 Warehouse = OBJECT STORE (S3 / GCS / Azure Blob)             │
+│                                                                    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Process:**
+1. A book (log line) arrives with a label on its spine (`component="printer"`).
+2. The librarian (**distributor/ingester**) hashes the labels to decide which shelf (**stream**) it belongs on.
+3. Books with identical spine labels get stacked into the same box (**chunk**).
+4. Once a box is full, it's sealed, shrink-wrapped (**compressed**), and sent to the warehouse (**object storage**).
+5. The card catalog (**index**) only stores "Box #3b2c on Shelf X" — not the book contents — so lookups are fast.
+
+---
+
+## 3. Complete Data/Process Flow
+
+### STEP 1 — A Log Line Arrives with Labels
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  STEP 1: Raw log line + labels                                │
+│                                                                 │
+│  {component="printer", location="f2c16", level="error"}       │
+│  "Printing is not supported by this printer"                  │
+│                                                                 │
+│  💡 Labels describe WHO/WHERE the log came from;               │
+│     the text after is the actual log message.                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### STEP 2 — Labels Get Hashed into a Stream ID
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  STEP 2: Hashing labels → Stream ID                            │
+│                                                                 │
+│  {component="printer", location="f2c16", level="error"}       │
+│                    │  hash                                     │
+│                    ▼                                           │
+│           Stream ID: 3b2cea09797978fc                          │
+│                                                                 │
+│  💡 Same label SET → same Stream ID, every time.                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### STEP 3 — Log Entry Added to a Chunk
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  STEP 3: Log entry placed into a chunk                         │
+│                                                                 │
+│  Chunk (Stream 3b2cea09797978fc):                              │
+│    "Printing is not supported by this printer"                 │
+│                                                                 │
+│  💡 A chunk is unique per tenant AND per label set.             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### STEP 4 — More Logs with Same Labels Join the Same Chunk
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  STEP 4: Additional matching logs append to same chunk         │
+│                                                                 │
+│  Chunk (Stream 3b2cea09797978fc):                              │
+│    "Printing is not supported by this printer"                 │
+│    "Out of paper"                                               │
+│    "Too much paper"                                             │
+│                                                                 │
+│  💡 No new chunk is created as long as labels match exactly.    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### STEP 5 — Chunk Fills, Compresses, and Is Stored
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  STEP 5: Compress and store the chunk                          │
+│                                                                 │
+│   Printing is not supported...   ──▶   [■■■ compressed ■■■]    │
+│   Out of paper                                                  │
+│   Too much paper                                                │
+│                                                                 │
+│  💡 Compression happens once the chunk is "full" or flushed.    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### STEP 6 — A Small Index Entry Is Kept
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  STEP 6: Index records where to find the chunk                 │
+│                                                                 │
+│  Index entry: Stream 3b2cea09797978fc → Chunk location          │
+│                                                                 │
+│  💡 The index is small — it's a "table of contents," not the    │
+│     actual log text.                                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### STEP 7 — Different Labels Create a Different Stream/Chunk
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  STEP 7: A new label value = a brand-new stream                │
+│                                                                 │
+│  {component="printer", location="f2c16", level="info"}         │
+│  "Consider the environment before printing this log message"   │
+│                    │  hash                                     │
+│                    ▼                                           │
+│           Stream ID: fd9a709ddf43a93a  (DIFFERENT!)             │
+│                                                                 │
+│  💡 Changing even ONE label value (error → info) routes the     │
+│     log into an entirely separate stream and chunk.             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Deep Dive Sections
+
+### 🏷️ Labels
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: Key/value metadata attached to a log line          │
+│ CONTAINS:   component, location, level (any key names)         │
+│ WHY IT MATTERS: Labels are hashed to determine the stream/     │
+│                 chunk a log belongs to, and are what you        │
+│                 query/filter by in LogQL.                       │
+│                                                                  │
+│ Example A: {component="printer", location="f2c16",              │
+│             level="error"}                                       │
+│ Example B: {component="printer", location="f2c16",               │
+│             level="info"}   ← only "level" changed               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 🔑 Stream ID
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: A hash of a unique label key/value combination     │
+│ CONTAINS:   A hex hash string (e.g., 3b2cea09797978fc)         │
+│ WHY IT MATTERS: Determines which ingester + chunk receives      │
+│                 the log; identical labels = identical stream    │
+│                                                                  │
+│ Example A: level="error" → 3b2cea09797978fc                     │
+│ Example B: level="info"  → fd9a709ddf43a93a  (different!)        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 📦 Chunk
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: A container of log lines for one stream over a     │
+│             specific time range                                 │
+│ CONTAINS:   MagicNumber, version, encoding, structured          │
+│             metadata, label bytes, checksum, compressed          │
+│             blocks (each with #entries, mint/maxt, offset/len)  │
+│ WHY IT MATTERS: This is where the actual log TEXT lives —       │
+│                 compressed and stored in object storage          │
+│                                                                  │
+│ Example A: Chunk for {level="error"} holds 3 printer errors      │
+│ Example B: Chunk for {level="info"} holds the info message       │
+│            — entirely separate chunk, separate storage object    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 📇 Index
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: A lookup table mapping label sets → chunk           │
+│             locations                                            │
+│ CONTAINS:   TSDB (recommended) or BoltDB (deprecated) format     │
+│ WHY IT MATTERS: Lets Loki find the right chunk(s) WITHOUT        │
+│                 scanning all log text — fast, cheap queries      │
+│                                                                  │
+│ Example A: TSDB — modern, extensible, gets new features          │
+│ Example B: BoltDB — legacy, deprecated, no new features          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 🧩 Block (inside a Chunk)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: A sub-unit inside a chunk holding several entries   │
+│ CONTAINS:   ts (timestamp, varint), len (uvarint), log bytes,   │
+│             #symbols referencing structured metadata             │
+│ WHY IT MATTERS: Blocks are individually compressed, allowing     │
+│                 partial decompression instead of the whole chunk │
+│                                                                  │
+│ Example A: Block holding "Printing is not supported..." entry    │
+│ Example B: Block holding "Out of paper" entry — separate ts,     │
+│            separate len, same chunk                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 🗂️ Structured Metadata
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: A section in the chunk storing non-repeated         │
+│             strings (label names/values used by log entries)    │
+│ CONTAINS:   Compressed label strings + lengths                   │
+│ WHY IT MATTERS: Symbols in blocks reference this section         │
+│                 instead of repeating full strings — saves space  │
+│                                                                  │
+│ Example A: label "component" stored once, referenced many times  │
+│ Example B: label "location" stored once, referenced many times   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 🚦 Distributor
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: The entry point for writes                          │
+│ CONTAINS:   Consistent hash ring logic                           │
+│ WHY IT MATTERS: Hashes each stream and routes it (plus           │
+│                 replicas) to the correct ingester(s); waits for  │
+│                 quorum before acknowledging success               │
+│                                                                  │
+│ Example A: Stream 3b2cea09797978fc → Ingester 1 + replicas       │
+│ Example B: Stream fd9a709ddf43a93a → Ingester 2 + replicas       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 🧱 Ingester
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: The write-side worker that builds chunks            │
+│ CONTAINS:   In-memory chunk data, references to Index (I) and   │
+│             Chunks (C) caches                                    │
+│ WHY IT MATTERS: Creates a new chunk OR appends to an existing    │
+│                 one for a stream, then acknowledges the write     │
+│                                                                  │
+│ Example A: Receives error log → appends to existing chunk        │
+│ Example B: Receives brand-new stream's log → creates new chunk   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 🔍 Querier
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: The read-side worker that fetches & merges data     │
+│ CONTAINS:   References to Index (I) and Chunks (C) caches        │
+│ WHY IT MATTERS: Pulls sub-queries from the scheduler, checks     │
+│                 in-memory ingester data first, falls back to     │
+│                 object storage, then dedupes results              │
+│                                                                  │
+│ Example A: Query hits recent logs still in ingester memory       │
+│ Example B: Query hits older logs → lazily loads from object      │
+│            store instead                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 🗄️ Object Store
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: Long-term backend storage (S3 / GCS / Azure Blob /  │
+│             MinIO)                                                │
+│ CONTAINS:   Both Index and Chunks (via the "index shipper")      │
+│ WHY IT MATTERS: Single storage backend for everything since      │
+│                 Loki 2.0 — simple, cheap, and where all future   │
+│                 development happens                               │
+│                                                                  │
+│ Example A: S3 bucket storing chunks for tenant "fake"            │
+│            (single-tenant mode)                                   │
+│ Example B: GCS bucket storing chunks partitioned by real          │
+│            tenant IDs (multi-tenant mode, via X-Scope-OrgID)      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 💾 Memcaches (Result / Index / Chunk caches)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ WHAT IT IS: A caching layer speeding up reads                   │
+│ CONTAINS:   R = Results cache, I = Index cache, C = Chunks cache│
+│ WHY IT MATTERS: Query Frontend caches Results; Ruler, Ingester,  │
+│                 and Querier all cache Index/Chunks to avoid       │
+│                 repeated object-store round trips                │
+│                                                                  │
+│ Example A: Query Frontend reuses a cached Result (R) for a       │
+│            repeated query — skips full read path                 │
+│ Example B: Querier reuses cached Chunks (C) instead of            │
+│            re-fetching from the object store                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Full Lifecycle Diagram (End-to-End)
+
+```
+1️⃣  Client sends HTTP POST with streams + log lines
+        ▼
+2️⃣  DISTRIBUTOR hashes each stream (consistent hash ring)
+        ▼
+3️⃣  DISTRIBUTOR sends stream + replicas → INGESTER(s)
+        ▼
+4️⃣  INGESTER creates/appends to a CHUNK for that stream
+        ▼
+5️⃣  INGESTER acknowledges write → DISTRIBUTOR waits for QUORUM
+        ▼
+6️⃣  DISTRIBUTOR returns 2xx (success) or 4xx/5xx (failure) to client
+        ▼
+        ⋯ time passes, chunk fills ⋯
+        ▼
+7️⃣  Chunk is compressed + flushed, along with an INDEX entry,
+     to OBJECT STORE (S3/GCS/Azure/MinIO)
+
+═══════════════════ later: a query arrives ═══════════════════
+
+1️⃣  Client sends HTTP GET with a LogQL query → QUERY FRONTEND
+        ▼
+2️⃣  QUERY FRONTEND splits into sub-queries → QUERY SCHEDULER
+        ▼
+3️⃣  QUERIER pulls sub-queries from the scheduler
+        ▼
+4️⃣  QUERIER asks INGESTERS for in-memory (not-yet-flushed) data
+        ▼
+5️⃣  If insufficient, QUERIER lazily loads from OBJECT STORE
+     (using the INDEX to find the right CHUNKS)
+        ▼
+6️⃣  QUERIER deduplicates results → returns sub-query result
+        ▼
+7️⃣  QUERY FRONTEND merges all sub-query results → final answer
+     returned to client
+```
+
+---
+
+## 6. Comparison Example — What Changes vs. What Stays the Same
+
+```
+╔══════════════════════════════╦══════════════════════════════╗
+║   SCENARIO A                  ║   SCENARIO B                   ║
+╠════════════════════════════════════════════════════════════╣
+║ Labels:                       ║ Labels:                        ║
+║ {component="printer",         ║ {component="printer",          ║
+║  location="f2c16",            ║  location="f2c16",              ║
+║  level="error"}                ║  level="info"}   ← CHANGED      ║
+║                                 ║                                  ║
+║ Stream ID: 3b2cea09797978fc   ║ Stream ID: fd9a709ddf43a93a      ║
+║ (DIFFERENT hash)               ║ (DIFFERENT hash)                 ║
+║                                 ║                                  ║
+║ Chunk: holds 3 error logs      ║ Chunk: holds 1 info log           ║
+║ ("Printing is not supported…", ║ ("Consider the environment…")    ║
+║  "Out of paper", "Too much     ║                                   ║
+║  paper")                        ║                                   ║
+╚════════════════════════════════════════════════════════════╝
+
+CAUSE:  One label value changed (level: error → info)
+EFFECT: Entirely new Stream ID → entirely new chunk, stored
+        and indexed separately, even though component/location
+        are identical.
+```
+
+---
+
+## 7. Quick Reference Card
+
+```
+┌───────────────────┬────────────────────────┬───────────────┬───────────────────────────────┐
+│ TERM               │ CONTAINS                │ SIZE/FORMAT    │ PURPOSE                        │
+├───────────────────┼────────────────────────┼───────────────┼───────────────────────────────┤
+│ 🏷️ Label            │ key="value" pairs        │ text           │ Identify/filter log streams     │
+│ 🔑 Stream ID        │ hash of label set        │ hex hash       │ Route logs to consistent shard  │
+│ 📦 Chunk            │ compressed log entries   │ binary, per    │ Store actual log text           │
+│                     │  in blocks                │ stream/tenant  │                                  │
+│ 🧩 Block             │ ts, len, log bytes,      │ compressed     │ Sub-unit of a chunk              │
+│                     │  #symbols                 │ sub-section    │                                  │
+│ 🗂️ Structured        │ non-repeated label       │ compressed     │ Dedup string storage in chunk    │
+│    Metadata          │ strings                   │ section        │                                  │
+│ 📇 Index             │ label set → chunk         │ TSDB/BoltDB    │ Fast lookup w/o reading chunks   │
+│                     │  location                  │                │                                  │
+│ 🚦 Distributor       │ hash-ring routing logic   │ microservice   │ Entry point for writes           │
+│ 🧱 Ingester          │ in-memory chunk builder    │ microservice   │ Builds/appends chunks             │
+│ 🔍 Querier           │ read/merge logic           │ microservice   │ Fetches + dedupes query results  │
+│ 🗄️ Object Store      │ index + chunks             │ S3/GCS/Azure/  │ Long-term storage backend         │
+│                     │                             │ MinIO          │                                  │
+│ 💾 Memcaches         │ R (results), I (index),    │ cache layer    │ Speed up repeated reads           │
+│                     │  C (chunks)                 │                │                                  │
+└───────────────────┴────────────────────────┴───────────────┴───────────────────────────────┘
+```
+
+---
+
+## 8. Key Takeaways ✅
+
+**On Data Format**
+- ✅ Loki stores exactly two file types: **index** (table of contents) and **chunks** (actual log data).
+- ✅ Labels are hashed into a **Stream ID**; identical label sets always hash to the same stream.
+- ✅ A **chunk** is unique per tenant *and* per label set — change one label value and you get a new chunk.
+
+**On Storage**
+- ✅ Since Loki 2.0, everything (index + chunks) lives in **one object storage backend** via the "index shipper."
+- ✅ **TSDB** is the recommended index format; **BoltDB** is deprecated.
+
+**On Write Path**
+- ✅ Distributor → hash → Ingester(s) → chunk created/appended → quorum acknowledgment → success/failure response.
+
+**On Read Path**
+- ✅ Query Frontend → split into sub-queries → Scheduler → Querier → checks Ingester memory first, then Object Store → dedupe → merge → return.
+
+**On Multi-Tenancy**
+- ✅ Tenant ID comes from the `X-Scope-OrgID` header; if multi-tenancy is off, tenant ID defaults to `"fake"`.
+
+**One-line flow:**
+`Log line + Labels → Stream ID (hash) → Chunk (compressed) → Index entry → Object Store → (queried back via Querier/Query Frontend)`
+
+---
+
+## 9. Memory Trick 🧠
+
+> **"INDEX is the MAP, CHUNK is the TERRITORY."**
+> The index tells you *where* to look (small, fast to scan);
+> the chunk holds *what* actually happened (large, compressed log text).
+> Same labels = same shelf (stream); different labels = different shelf, even if everything else matches.
+
+---
+
+## Plain-Language Recap of the Original Diagrams
+
+**Image 1 (Data Format diagram)** showed how a single log line — tagged with labels like `component="printer"`, `location="f2c16"`, `level="error"` — gets its labels hashed into a Stream ID (`3b2cea09797978fc`), and how that log line, along with other logs sharing the exact same labels, gets packed into one chunk, which is later compressed and stored. It also showed that a log with even one different label (`level="info"`) hashes to a totally different Stream ID (`fd9a709ddf43a93a`) and ends up in a separate chunk. Meanwhile, a small, separate index is kept just to help look up which chunk holds which stream.
+
+**Image 2 (Write/Read path diagram)** showed Loki's write path (pink arrows) flowing from the **Distributor** into the **Ingester**, which writes into the **Object Store** (holding both Index and Chunks) and also feeds the **Ruler**. The read path (green arrows) flows from the **Object Store** and **Ingester** into the **Querier**, then up to the **Query Frontend**, which returns results to the client. On the right, **Memcaches** (Results, Index, Chunks) sit alongside **Cluster Services** (Compactor, Consul) supporting the whole system.
