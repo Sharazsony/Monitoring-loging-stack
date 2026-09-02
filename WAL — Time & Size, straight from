@@ -1,0 +1,11 @@
+WAL — Time & Size, straight from the docs
+Size
+Each WAL segment file = 128MB
+Prometheus always keeps a minimum of 3 WAL segment files
+So minimum WAL footprint ≈ 3 × 128MB = 384MB (before compression)
+
+
+Time
+The guarantee is: at least 2 hours of raw data must be recoverable from WAL at any time (this matches the 2h head-block cycle — WAL must cover whatever hasn't been flushed to a block yet)
+On a low-traffic server: 3 segment files might already hold well over 2 hours of data (fewer samples = segments fill slower)
+On a high-traffic server: 3 segments (384MB) might not be enough to hold 2 hours of data (segments fill faster with more samples) → Prometheus will automatically keep more than 3 files to guarantee that 2-hour minimum is met
