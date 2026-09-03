@@ -1,0 +1,463 @@
+# Loki Labels, Cardinality & Structured Metadata : Complete Understanding Guide 📊
+
+---
+
+## One-Sentence Answer
+
+**Loki doesn't index your log text — it indexes small, stable "labels" that group logs into streams, so choosing few, low-cardinality, static labels (and pushing high-cardinality fields into structured metadata instead) is the single biggest factor in whether Loki runs fast and cheap or slow and expensive.**
+
+---
+
+## Analogy Section 🗂️
+
+Think of Loki like a **library that only catalogs books by a few shelf tags, never by reading every page**.
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║              📚 THE LOKI LIBRARY ANALOGY                       ║
+║                                                                ║
+║  🏷️ SHELF TAGS (Labels) = deployment_environment, cloud_region ║
+║     Small number of tags, each with a handful of possible       ║
+║     values. Librarian (Loki) uses these to find the right        ║
+║     SHELF (stream) fast.                                          ║
+║                                                                ║
+║  📖 BOOKS ON THE SHELF (Log lines) = actual log content            ║
+║     NOT catalogued individually — once you're at the shelf,        ║
+║     the librarian flips through every book by hand (brute-force     ║
+║     filter search) — still fast because the shelf is small.           ║
+║                                                                ║
+║  🎫 STICKY NOTE IN EACH BOOK (Structured metadata)                     ║
+║     Extra info (like a due-date or borrower ID) attached to EACH        ║
+║     book individually, without needing its own shelf tag. Too high        ║
+║     cardinality to be a shelf tag but still useful when reading.           ║
+║                                                                                ║
+║  ⚠️ If you make a shelf tag out of something with 10,000 values                ║
+║     (like "book title") → you get 10,000 tiny one-book shelves                  ║
+║     → librarian wastes time managing shelves instead of finding books!            ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+**Process:**
+1. Logs arrive tagged with a small set of stable **labels** (shelf tags).
+2. Loki groups them into **streams** — one shelf per unique label combination.
+3. Queries first find the right shelf (via labels), then brute-force scan books on it (filter expressions).
+4. High-cardinality extras go on a sticky note (**structured metadata**) instead of becoming a new shelf tag.
+
+---
+
+## Complete Data/Process Flow
+
+### STEP 1 — A Label Is a Key-Value Pair
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🏷️ STEP 1: What a Label Looks Like                        │
+│                                                            │
+│   deployment_environment = development                     │
+│   cloud_region          = us-west-1                          │
+│   namespace              = grafana-server                      │
+│                                                            │
+│  A set of log messages sharing ALL these labels =            │
+│    ONE log stream                                              │
+│                                                            │
+│  💡 Loki does NOT index log line content — only the labels     │
+└─────────────────────────────────────────────────────────┘
+```
+
+### STEP 2 — Default `service_name` Discovery Order
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🔍 STEP 2: How Loki Auto-Picks service_name                │
+│                                                            │
+│  1. If service_name already set → use it directly              │
+│  2. Else check, IN ORDER, first non-empty value of:              │
+│       service → app → application → app_name → name →              │
+│       app_kubernetes_io_name → container → container_name →          │
+│       k8s_container_name → component → workload → job →                │
+│       k8s_job_name                                                       │
+│  3. If NONE found → value = unknown_service                                │
+│                                                            │
+│  💡 Configurable via discover_service_name in limits_config                 │
+└─────────────────────────────────────────────────────────┘
+```
+
+### STEP 3 — Default OpenTelemetry Resource Attributes → Labels
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🛰️ STEP 3: OTel Resource Attributes Auto-Promoted            │
+│                                                            │
+│  cloud.availability_zone → cloud_availability_zone (dots→_)   │
+│  k8s.pod.name           → k8s_pod_name                         │
+│  service.name            → service_name                          │
+│  ... (15 total default attributes)                                 │
+│                                                            │
+│  ⚠️ CAUTION: k8s.pod.name & service.instance.id are HIGH         │
+│     cardinality — no longer recommended as default labels           │
+│     (kept for backward compatibility only)                            │
+│                                                            │
+│  💡 Loki's default index label limit = 15 — some default OTel        │
+│     attributes are mutually exclusive so they don't all fire            │
+└─────────────────────────────────────────────────────────┘
+```
+
+### STEP 4 — Cardinality Math Example (Static Labels)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🧮 STEP 4: How Combining Labels Multiplies Streams           │
+│                                                            │
+│   status_code: {200, 404, 500}      → 3 values                 │
+│   action:      {GET,POST,PUT,PATCH,DELETE} → 5 values            │
+│   status_code × action = 3 × 5 = 15 unique streams                 │
+│                                                            │
+│   + ADD endpoint: {/cart, /products, /customers} → 3 values          │
+│   15 × 3 = 45 unique streams (TRIPLED!)                                │
+│                                                            │
+│  💡 Adding just ONE more label can multiply your stream count          │
+│     — this is why Loki defaults to a 15-label limit                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+### STEP 5 — Real Apache Log Regex → Dynamic Labels Example
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🔬 STEP 5: Extracting action & status_code as Labels          │
+│                                                            │
+│  4 input log lines (GET/POST × 200/400):                        │
+│   11.11.11.11 ... "GET /1986.js..." 200 ...                       │
+│   11.11.11.12 ... "POST /1986.js..." 200 ...                        │
+│   11.11.11.13 ... "GET /1986.js..." 400 ...                          │
+│   11.11.11.14 ... "POST /1986.js..." 400 ...                           │
+│                                                            │
+│  Result → 4 SEPARATE STREAMS:                                            │
+│   {job="apache",env="dev",action="GET",status_code="200"}                  │
+│   {job="apache",env="dev",action="POST",status_code="200"}                   │
+│   {job="apache",env="dev",action="GET",status_code="400"}                      │
+│   {job="apache",env="dev",action="POST",status_code="400"}                       │
+│                                                            │
+│  💡 Adding an `ip` label too → EVERY user's EVERY request combo           │
+│     becomes its own stream → thousands/tens of thousands of streams          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### STEP 6 — Real `--analyze-labels` Output (Cardinality Debugging)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🩺 STEP 6: logcli series --analyze-labels Example              │
+│                                                            │
+│   Total Streams:  25017                                          │
+│   Unique Labels:  8                                                │
+│                                                            │
+│   Label Name  Unique Values  Found In Streams                        │
+│   requestId   24653          24979        ⚠️ BAD — near 1:1            │
+│   logStream   1194           25016                                       │
+│   logGroup    140            25016                                         │
+│   accountId   13             25016                                           │
+│   logger      1              25017                                             │
+│                                                            │
+│  💡 requestId with 24,653 unique values ≈ 24,979 streams is a           │
+│     textbook high-cardinality mistake — remove as a label,                 │
+│     use a filter instead: {logGroup="group1"} |= "requestId=32422355"        │
+└─────────────────────────────────────────────────────────┘
+```
+
+### STEP 7 — Structured Metadata Enable & Limits
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🎫 STEP 7: Turning On Structured Metadata                      │
+│                                                            │
+│  limits_config:                                                    │
+│    allow_structured_metadata: true                                   │
+│    volume_enabled: true                                                │
+│    retention_period: 672h   # 28 days                                    │
+│                                                            │
+│  Hard limits per log line:                                                │
+│    max_structured_metadata_size: 64KB (default)                             │
+│    max_structured_metadata_entries_count: 128 (default)                       │
+│                                                            │
+│  Exceeding either → HTTP 400, rejected, counted in                              │
+│    loki_discarded_samples_total (reason: structured_metadata_too_large            │
+│    or structured_metadata_too_many)                                                 │
+│                                                            │
+│  💡 Requires chunk format V4 (schema version ≥ 13) AND the                          │
+│     tsdb index type — NOT supported on deprecated boltdb-shipper                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+### STEP 8 — Querying Structured Metadata
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🔎 STEP 8: Filtering by Structured Metadata Fields               │
+│                                                            │
+│  Single field:                                                       │
+│    {job="example"} | pod="myservice-abc1234-56789"                       │
+│                                                            │
+│  Multiple fields:                                                          │
+│    {job="example"} | pod="myservice-abc1234-56789"                            │
+│                     | trace_id="0242ac120002"                                    │
+│                                                            │
+│  Metric query with too many series → use keep/drop:                                │
+│    count_over_time({job="example"} | trace_id="0242ac120002"                          │
+│                     | keep job  [5m])                                                    │
+│                                                            │
+│  💡 Structured metadata auto-extracts into result labels — this                          │
+│     can trigger "maximum of series (50000) reached" if not filtered                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Dive Sections
+
+### 🏷️ Labels (Static)
+
+```
+┌───────────────────────────────────────────────────────┐
+│  WHAT IT IS: Key-value pair indexed by Loki to identify    │
+│              a log stream                                    │
+│  CONTAINS:   Things like namespace, cluster, region,          │
+│              application, environment                           │
+│  WHY IT MATTERS: This IS the index — the only thing Loki       │
+│    searches quickly; log content itself is never indexed         │
+│                                                            │
+│  Example A: {namespace="mynamespace", cluster="cluster123",       │
+│              filename="/var/log/myapp.log"}                         │
+│             → 1 stable stream, queries fast                           │
+│  Example B: Same labels but 1,000 different hosts as a               │
+│              "host" label → still FINE, because host is                │
+│              static/bounded even with 1,000 values                       │
+└───────────────────────────────────────────────────────┘
+```
+
+### 🔀 Dynamic Labels
+
+```
+┌───────────────────────────────────────────────────────┐
+│  WHAT IT IS: Labels extracted FROM the log line content     │
+│              at ingestion time (e.g. via regex/logfmt)         │
+│  CONTAINS:   Values parsed from each log entry, e.g. level,      │
+│              action, status_code                                   │
+│  WHY IT MATTERS: Powerful but dangerous — every new distinct        │
+│    value combination creates a NEW stream                             │
+│                                                            │
+│  Example A: dynamic `level` label on a medium-volume app               │
+│             → splits ONE app's logs into up to 5 streams                 │
+│             → 5x the chunks stored, extra overhead loading them            │
+│  Example B: Same app, NO level label, use filter instead:                    │
+│             {app="loki"} |= "level=error"                                       │
+│             → proven "just as fast" for many apps, per the doc,                    │
+│               single stream, no extra chunk overhead                                  │
+└───────────────────────────────────────────────────────┘
+```
+
+### 🧮 Cardinality
+
+```
+┌───────────────────────────────────────────────────────┐
+│  WHAT IT IS: The number of distinct values a label(s)          │
+│              combination can take → equals # of streams           │
+│  CONTAINS:   N/A — it's a measurement, not a data structure          │
+│  WHY IT MATTERS: High cardinality = huge index + thousands of           │
+│    tiny chunks flushed = major performance degradation                     │
+│                                                            │
+│  Example A: status_code (3 values) × action (5 values)                       │
+│             = 15 streams                                                        │
+│  Example B: + endpoint (3 values)                                                  │
+│             = 15 × 3 = 45 streams (3x increase from 1 more label)                     │
+│  Scale guidance: keep a single tenant under 100,000 active                              │
+│    streams and <1,000,000 streams per 24h — but that's for HUGE                            │
+│    tenants sending 10TB+/day; 10x smaller tenants should aim for                              │
+│    10x fewer labels                                                                              │
+└───────────────────────────────────────────────────────┘
+```
+
+### 🎫 Structured Metadata
+
+```
+┌───────────────────────────────────────────────────────┐
+│  WHAT IT IS: Metadata attached to individual log lines          │
+│              WITHOUT indexing it or adding it to the log            │
+│              line content                                              │
+│  CONTAINS:   High-cardinality but frequently-queried fields,             │
+│              e.g. pod names, process IDs, container IDs, trace IDs         │
+│  WHY IT MATTERS: Lets you query on high-cardinality fields WITHOUT           │
+│    blowing up the index — the "escape valve" for cardinality                    │
+│                                                            │
+│  Example A: k8s.pod.name AS A LABEL                                                │
+│             → high cardinality, huge index, NOT recommended anymore                    │
+│  Example B: k8s.pod.name AS STRUCTURED METADATA                                            │
+│             → still queryable ({job="example"} | pod="...")                                   │
+│             → does NOT bloat the index                                                            │
+│                                                            │
+│  Requirements: chunk format V4 (schema ≥13) + tsdb index type                                        │
+│  Limits: 64KB max size, 128 max entries per log line (both defaults)                                    │
+└───────────────────────────────────────────────────────┘
+```
+
+### 📛 Label Format Rules
+
+```
+┌───────────────────────────────────────────────────────┐
+│  WHAT IT IS: Naming restrictions Loki inherits from            │
+│              Prometheus                                            │
+│  CONTAINS:   Regex: [a-zA-Z_:][a-zA-Z0-9_:]*                          │
+│  WHY IT MATTERS: Invalid characters silently break labeling,             │
+│    and double-underscore names are reserved internally                     │
+│                                                            │
+│  Example A: app.kubernetes.io/name (invalid — has dots/slash)               │
+│             → converted to: app_kubernetes_io_name (valid)                     │
+│  Example B: __stream_shard__ style name                                            │
+│             → RESERVED for internal labels, hidden by default in                     │
+│               label browser/query builder/autocomplete — don't use                      │
+│               leading/trailing double underscores for your own labels                       │
+└───────────────────────────────────────────────────────┘
+```
+
+### ⏱️ Ingestion Ordering & Streams
+
+```
+┌───────────────────────────────────────────────────────┐
+│  WHAT IT IS: Rule governing how out-of-order logs are           │
+│              accepted per stream                                    │
+│  CONTAINS:   Default 2-hour ingestion time window per stream            │
+│  WHY IT MATTERS: Sending entries "too far behind" for a given            │
+│    stream returns an error — label strategy affects this                    │
+│                                                            │
+│  Example A: {environment="production"} single stream shared by            │
+│             a slow_app and fast_app → if slow_app lags, it risks               │
+│             hitting the "too far behind" error for the shared stream              │
+│  Example B: Split into                                                                │
+│             {environment="production", app="slow_app"} and                              │
+│             {environment="production", app="fast_app"}                                     │
+│             → each maintains its OWN ingestion order independently                            │
+└───────────────────────────────────────────────────────┘
+```
+
+---
+
+## Full Lifecycle Diagram
+
+```
+1️⃣  Log line arrives at a Loki client (Alloy, OTel Collector, etc.)
+        ▼
+2️⃣  🏷️ Client applies LABELS — some automatic (service_name
+       discovery chain, OTel resource attributes), some custom
+       (namespace, cluster, filename, environment)
+        ▼
+3️⃣  Loki groups the log line into a STREAM based on the exact
+       combination of label key=value pairs
+        ▼
+4️⃣  🧮 CARDINALITY CHECK (conceptual): more labels / more unique
+       values per label = more streams = bigger index + smaller
+       chunks (e.g. status_code×action×endpoint = 45 streams)
+        ▼
+5️⃣  🎫 High-cardinality fields (pod name, trace_id, request_id)
+       are instead attached as STRUCTURED METADATA — not indexed,
+       not counted toward stream cardinality
+        ▼
+6️⃣  Log line + labels (indexed) + structured metadata
+       (not indexed) is pushed to the Distributor → Ingester →
+       chunks → Object Storage
+        ▼
+7️⃣  🔎 At QUERY TIME: Loki first finds the right STREAM(S) via
+       labels ({job="apache"}), THEN brute-force filters log
+       content (|= "text") or filters on structured metadata
+       (| pod="...")
+        ▼
+8️⃣  🩺 Periodically, use logcli --analyze-labels to catch runaway
+       cardinality (e.g. requestId: 24653 unique values in 24979
+       streams) and fix the labeling strategy iteratively
+```
+
+---
+
+## Comparison Example
+
+**What changes vs. what stays the same** — the doc's own `requestId` example:
+
+```
+┌───────────────────────┬─────────────────────┬─────────────────────┐
+│                        │  AS A LABEL (BAD)       │  AS FILTER/METADATA     │
+├───────────────────────┼─────────────────────┼─────────────────────┤
+│ requestId              │  24,653 unique values      │  Not indexed at all      │
+│ Streams created         │  ~24,979 streams              │  0 extra streams           │
+│ Query method              │  {requestId="..."}               │  {logGroup="group1"}          │
+│                              │                                      │  |= "requestId=32422355"        │
+│ Index size impact              │  HUGE — near 1:1 label:stream         │  None                              │
+│ Performance                       │  Severely degraded                       │  Fast (brute-force on shelf)          │
+└───────────────────────┴─────────────────────┴─────────────────────┘
+```
+
+💡 **What stays the same:** the underlying log data and the ability to search for a specific `requestId`. **What changes:** whether Loki has to maintain a separate index entry (and stream/chunk) for every single value.
+
+---
+
+## Quick Reference Card
+
+```
+╔═══════════════════════╦═══════════════════════════╦══════════════════════╗
+║ CONCEPT                  ║ WHAT IT'S FOR                 ║ CARDINALITY GUIDANCE      ║
+╠═══════════════════════╬═══════════════════════════╬══════════════════════╣
+║ 🏷️ Static Label            ║ Region, cluster, app, env,        ║ Bounded values OK even       ║
+║                              ║ namespace — describes SOURCE        ║ if many (e.g. 1,000 hosts)       ║
+║ 🔀 Dynamic Label              ║ Value parsed from log content         ║ Keep to single/low-double-        ║
+║                                ║ at ingest (e.g. level, action)          ║ digit unique values                 ║
+║ 🎫 Structured Metadata           ║ High-cardinality, frequently-              ║ No index impact; 64KB/128              ║
+║                                    ║ queried fields (pod name, trace_id)          ║ entries max per log line                  ║
+║ 🔍 Filter Expression                 ║ Searching log line CONTENT                       ║ N/A — brute-force, no                     ║
+║                                        ║ (|=, |~) without adding a label                    ║ cardinality cost                              ║
+║ 📛 Default index label limit             ║ Loki's built-in ceiling                              ║ 15 labels                                         ║
+║ 📛 Recommended label count                 ║ Best-practice range                                    ║ 10–15 labels max                                     ║
+║ 📛 Structured metadata size limit             ║ Per log line, default                                    ║ 64KB / 128 entries                                       ║
+║ 📛 Ingestion order window                       ║ Per-stream ordering tolerance                              ║ 2 hours (default)                                           ║
+╚═══════════════════════╩═══════════════════════════╩══════════════════════╝
+```
+
+---
+
+## Key Takeaways
+
+**Fundamentals:**
+- ✅ Loki indexes **labels**, never log content — content is searched via fast brute-force filter expressions.
+- ✅ A unique combination of label key=value pairs defines a **stream**.
+- ✅ `service_name` is auto-populated using a defined fallback chain, ending in `unknown_service` if nothing matches.
+
+**Cardinality discipline:**
+- ✅ Combining even a few labels **multiplies** stream count (3×5=15, +1 label ×3 = 45).
+- ✅ Keep dynamic labels to **single/low-double-digit** unique values; static labels can have many bounded values (e.g. 1,000 hosts is fine).
+- ✅ Never label unbounded values (timestamp, IP, request ID, trace ID, order ID).
+- ✅ Use `logcli series --analyze-labels` to catch bad labels like `requestId` (24,653 values / 24,979 streams).
+
+**Structured metadata:**
+- ✅ Use it for high-cardinality, frequently-queried fields that don't belong in the index (pod names, trace IDs, container IDs).
+- ✅ Requires **chunk format V4** (schema ≥13) + **tsdb** index — not supported on deprecated boltdb-shipper.
+- ✅ Hard caps: **64KB** size and **128 entries** per log line by default; over-limit lines are rejected with HTTP 400.
+
+**Operational notes:**
+- ✅ `k8s.pod.name` and `service.instance.id` are default OTel labels but are **no longer recommended** — migrate them to structured metadata.
+- ✅ Labels must match `[a-zA-Z_:][a-zA-Z0-9_:]*`; invalid characters become underscores; avoid leading/trailing double underscores (reserved).
+- ✅ Separate streams by label (e.g. `app="slow_app"` vs `app="fast_app"`) when ingestion speeds differ, to avoid the "too far behind" error within the default 2-hour window.
+
+**One-line flow:**
+`Log line → labels applied (auto + custom) → grouped into stream → high-cardinality fields go to structured metadata instead → query finds stream via labels → brute-force filters content/metadata`
+
+---
+
+## Memory Trick 🧠
+
+> **"Labels are the shelf, Metadata is the sticky note."**
+> - If a value is **stable and low-cardinality** → it's a **label** (shelf tag) — used to FIND the stream.
+> - If a value is **high-cardinality but still searched often** → it's **structured metadata** (sticky note) — used to FILTER within the stream, without new shelves.
+> - If a value is **rarely searched or totally unbounded** → don't store it as either — just **filter the log text directly** (`|= "text"`).
+
+---
+
+## Plain-Language Summary
+
+The original Grafana Loki documentation set explains that Loki organizes logs into "streams" using indexed key-value **labels** (like `namespace`, `cluster`, or an auto-discovered `service_name`) rather than indexing the log text itself; queries first locate the right stream via labels, then brute-force scan its content. Because every unique combination of label values creates a new stream, and because combining even a few labels can multiply stream count dramatically (as shown by the `status_code`×`action`×`endpoint` example growing from 15 to 45 streams), the docs strongly recommend keeping labels few (10–15 max), static, and low-cardinality — reserving dynamic, log-derived labels for truly low-cardinality, long-lived values, and avoiding unbounded ones like timestamps, request IDs, or trace IDs entirely (illustrated by the real `--analyze-labels` output showing a disastrous `requestId` label with 24,653 unique values across 24,979 streams). For metadata that's high-cardinality but still frequently queried — pod names, trace IDs, container IDs — Loki offers **structured metadata**, which attaches data to each log line without indexing it, avoiding the index bloat that labels would cause, subject to size/entry-count limits and specific storage-format requirements. The documentation also covers practical mechanics: the default `service_name` discovery fallback chain, the default set of OpenTelemetry resource attributes promoted to labels (with a caution against two high-cardinality ones), Prometheus-style label naming rules, and how splitting streams by label can prevent out-of-order ingestion errors when different data sources ship logs at different speeds.
